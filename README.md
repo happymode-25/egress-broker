@@ -1,5 +1,7 @@
 # egress-broker
 
+[![CI](https://github.com/happymode-25/egress-broker/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/happymode-25/egress-broker/actions/workflows/ci.yml)
+
 A policy-enforcing proxy that sits between an LLM agent and the network.
 
 Single file, Python 3.9+, standard library only. No install step.
