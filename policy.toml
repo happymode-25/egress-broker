@@ -1,0 +1,316 @@
+# egress-broker default policy
+#
+# Fail-closed: anything not matched by a destination rule is DENIED.
+# Test that assumption with `python egress-broker.py --selftest` before trusting it.
+
+[defaults]
+# block | redact | report
+#   block   -> reject the request, upstream never sees it
+#   redact  -> forward with matches replaced by placeholders
+#   report  -> forward untouched, but write a finding to the audit log
+action = "block"
+
+# Requests larger than this are refused without buffering. 0 disables the cap.
+max_body_bytes = 4194304
+
+# Refuse bodies we cannot actually inspect, rather than passing them blind.
+# Content-Encoding: gzip/deflate/br are not inspected; they are reported.
+fail_closed_on_uninspectable = true
+
+# ---------------------------------------------------------------------------
+# Destinations. Most specific pattern wins; ties broken by longest pattern.
+# Patterns match host and optional port: "api.openai.com", "*.corp.internal:8443"
+#
+# PIN A DESTINATION TO ITS ADDRESSES. Add allowed_ips to a rule and the name is
+# no longer enough to reach it: the broker resolves the name first and refuses
+# the request if the address it got is not listed. Without the list the rule
+# accepts whatever DNS currently says, which is only as trustworthy as whoever
+# controls that resolver.
+#
+#   [[destinations]]
+#   pattern = "api.openai.com"
+#   action  = "allow"
+#   allowed_ips = ["52.94.236.248", "52.94.239.24"]   # literals, or CIDRs
+#
+# Three things to know before you turn it on:
+#   * No --dry-run, no check. Dry-run resolves nothing on purpose, so it skips
+#     allowed_ips entirely. Assert this in the e2e suite, not under dry-run.
+#   * It fails CLOSED. A name that will not resolve is refused rather than
+#     dialled, so a DNS outage becomes a denial rather than a bypass.
+#   * It rots. Hard-coded provider addresses go stale silently and deny all
+#     traffic to a host you thought was allowed. Keep the list reviewed, and
+#     pair it with an [[alerts]] rule so a sudden denial spike is visible.
+#
+# The rules below deliberately omit it: a shipped policy that starts denying
+# everything because a CDN moved is a policy nobody will keep switched on.
+# ---------------------------------------------------------------------------
+
+[[destinations]]
+pattern = "api.openai.com"
+action = "allow"
+reason = "primary model endpoint"
+
+[[destinations]]
+pattern = "api.anthropic.com"
+action = "allow"
+
+[[destinations]]
+pattern = "localhost"
+action = "allow"
+reason = "local inference (Ollama)"
+
+[[destinations]]
+pattern = "127.0.0.1"
+action = "allow"
+
+[[destinations]]
+pattern = "*.ollama.internal"
+action = "allow"
+
+# Retrieval backends the agent legitimately reads from.
+[[destinations]]
+pattern = "*.readthedocs.io"
+action = "allow"
+
+[[destinations]]
+pattern = "pypi.org"
+action = "allow"
+
+[[destinations]]
+pattern = "files.pythonhosted.org"
+action = "allow"
+
+# Never reachable from an agent, regardless of what a document says.
+[[destinations]]
+pattern = "*.pastebin.com"
+action = "deny"
+reason = "classic exfiltration sink"
+
+[[destinations]]
+pattern = "*.ngrok.io"
+action = "deny"
+reason = "attacker-controlled ingress"
+
+[[destinations]]
+pattern = "transfer.sh"
+action = "deny"
+
+[[destinations]]
+pattern = "*.onion"
+action = "deny"
+reason = "no egress to anonymity networks from an agent context"
+
+# ---------------------------------------------------------------------------
+# Secrets. Order matters only for reporting; all matches are collected.
+# ---------------------------------------------------------------------------
+
+[[secrets]]
+name = "aws_access_key"
+regex = "AKIA[0-9A-Z]{16}"
+action = "block"
+
+[[secrets]]
+name = "github_token"
+regex = "gh[pousr]_[A-Za-z0-9]{36,}"
+action = "block"
+
+[[secrets]]
+name = "slack_token"
+regex = "xox[baprs]-[A-Za-z0-9-]{10,}"
+action = "block"
+
+[[secrets]]
+name = "anthropic_key"
+regex = "sk-ant-[A-Za-z0-9_-]{20,}"
+action = "block"
+
+[[secrets]]
+name = "openai_key"
+regex = "sk-(?!ant-)[A-Za-z0-9]{20,}"
+action = "block"
+
+[[secrets]]
+name = "private_key_block"
+regex = "-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+action = "block"
+
+[[secrets]]
+name = "jwt"
+regex = "eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+action = "block"
+
+[[secrets]]
+name = "netrc_password"
+regex = "(?m)^password\\s+(\\S{8,})$"
+action = "block"
+
+[[secrets]]
+name = "high_entropy_token"
+# Shannon entropy over base64/hex-ish runs. Report-only: this is the rule that
+# produces false positives, so it must never be allowed to silently redact.
+regex = "\\b[A-Za-z0-9+/=_-]{40,}\\b"
+min_entropy = 4.3
+action = "report"
+
+# ---------------------------------------------------------------------------
+# Injection. An agent body that *instructs* the agent, or names a destination
+# other than the one it is talking to, is the exfiltration attempt itself.
+# ---------------------------------------------------------------------------
+
+[[injections]]
+name = "instruction_override"
+regex = "(?i)\\b(ignore|disregard|override)\\b[^.\\n]{0,40}\\b(previous|prior|above|all)\\b[^.\\n]{0,20}\\b(instruction|prompt|rule)s?\\b"
+action = "report"
+
+[[injections]]
+name = "role_reassignment"
+regex = "(?i)(^|\\n)\\s*(system|developer)\\s*:\\s"
+action = "report"
+
+[[injections]]
+name = "exfil_directive"
+regex = "(?i)\\b(send|post|upload|exfiltrate|transmit|forward)\\b[^.\\n]{0,40}\\b(to|at)\\b[^.\\n]{0,20}\\bhttps?://"
+action = "block"
+
+[[injections]]
+name = "credential_recall"
+regex = "(?i)\\b(print|reveal|output|repeat|show|disclose)\\b[^.\\n]{0,30}\\b(api[_ ]?key|token|password|secret|credential)s?\\b"
+action = "block"
+
+# High-entropy, API-shaped credential in free text. Blocks rather than reports,
+# because a provider key has no legitimate reason to appear in an agent body
+# that is not already an authenticated request.
+[[secrets]]
+name = "provider_key_in_prose"
+regex = "(?i)\\bsk-[a-z0-9]{16,}\\b"
+action = "block"
+
+# Luhn-valid 16-digit PAN, four groups of four. Kept report-only (not redacted)
+# because bare digit groups are common in retrieved documents; the Luhn check is
+# what separates an actual card number from an order id. Deliberately excludes
+# brand-prefixed text via the optional leading word.
+[[secrets]]
+name = "possible_card_number"
+regex = "(?:visa|mastercard|amex|discover)?\\s?[0-9]{4}[- ][0-9]{4}[- ][0-9]{4}[- ][0-9]{4}\\b"
+luhn = true
+action = "report"
+
+[[injections]]
+name = "curl_pipe_shell"
+regex = "(?i)\\b(curl|wget)\\b[^\\n|]{0,200}\\|\\s*(ba)?sh\\b"
+action = "block"
+
+# ---------------------------------------------------------------------------
+# Headers. Never let credentials ride outbound in a header the audit log keeps.
+# ---------------------------------------------------------------------------
+
+[headers]
+allow_credential_headers = ["x-api-key", "authorization", "cookie", "set-cookie"]
+allow_paths = ["/v1/chat/completions", "/v1/messages", "/api/chat", "/api/generate", "/v1/embeddings", "/v1/completions"]
+
+# ---------------------------------------------------------------------------
+# Client scopes. Different agents get different reachable hosts, so a
+# compromised one cannot spend another one's allowance.
+#
+# A scope matches on the peer address, on a header the client sets, or both.
+# Both is strongest: the network match outranks the header match, so a client on
+# a network that has its own scope cannot escape it by sending a header.
+#
+#   inherit = true   scope rules are consulted first, then the global list
+#   inherit = false  the scope's own list is the entire world for this client
+#
+# Unmatched clients fall back to the global list above. Nothing here is enabled
+# by default in the shipped policy: add the scopes your deployment actually runs
+# before relying on them, and confirm with
+#   egress-broker.py serve --dry-run && egress-broker.py query
+# that a request you expected to be scoped really was.
+# ---------------------------------------------------------------------------
+
+# [[clients]]
+# name = "researcher"
+# inherit = false
+# match_header = "x-egress-client"
+# match_value = "researcher"
+#
+# [[clients.destinations]]
+# pattern = "*.readthedocs.io"
+# action = "allow"
+#
+# [[clients.destinations]]
+# pattern = "api.openai.com"
+# action = "allow"
+
+# A scope pinned to a network, for agents that cannot be trusted to label
+# themselves. Note the deny: isolation here means the model endpoint is off
+# limits to whatever is running in that subnet.
+# [[clients]]
+# name = "sandbox"
+# inherit = false
+# cidrs = ["10.8.0.0/24"]
+#
+# [[clients.destinations]]
+# pattern = "*.ollama.internal"
+# action = "allow"
+
+# ---------------------------------------------------------------------------
+# Alerts. A rule that matches once is usually a false positive; the same rule
+# matching repeatedly in a short window is an incident. Counting is in-memory
+# and resets on restart; what fired is kept in the `alerts` table, so the
+# surviving evidence is the record, not the counter.
+#
+#   metric = rule_hits  selector counts matching findings; empty selector = any
+#   metric = denies     counts denials, optionally filtered by host glob
+#   metric = requests   counts requests to a host glob
+#   metric = new_host   fires once per host the broker has never seen
+#
+# cooldown_minutes defaults to window_minutes, so a sustained problem reports
+# once per window instead of once per request.
+# ---------------------------------------------------------------------------
+
+[[alerts]]
+name = "exfil_spike"
+metric = "rule_hits"
+selector = "exfil_directive"
+threshold = 1
+window_minutes = 10
+severity = "critical"
+
+[[alerts]]
+name = "credential_recall_attempt"
+metric = "rule_hits"
+selector = "credential_recall"
+threshold = 1
+window_minutes = 10
+severity = "critical"
+
+[[alerts]]
+name = "secret_in_body"
+metric = "rule_hits"
+selector = "aws_access_key"
+threshold = 1
+window_minutes = 15
+severity = "high"
+
+[[alerts]]
+name = "repeated_secret_matches"
+# No selector: any secret rule at all. Deliberately generous, because a single
+# hit is usually noise from a retrieved document and three are not.
+metric = "rule_hits"
+threshold = 3
+window_minutes = 5
+severity = "high"
+
+[[alerts]]
+name = "deny_storm"
+metric = "denies"
+threshold = 25
+window_minutes = 5
+severity = "high"
+
+[[alerts]]
+name = "first_contact_with_a_new_host"
+metric = "new_host"
+threshold = 1
+window_minutes = 60
+severity = "low"
+

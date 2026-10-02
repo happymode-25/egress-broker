@@ -1,0 +1,17 @@
+# Normalise line endings in the repository; check out LF everywhere.
+#
+# The audit store hashes the bytes of a request body, so a CRLF/LF flip would
+# change findings between machines. Keeping the tree LF-only means a policy file
+# or a test asset behaves identically on Windows and Linux.
+* text=auto eol=lf
+
+*.py   text diff=python
+*.toml text
+*.md   text
+*.yml  text
+*.service text
+
+# Never touched by line-ending conversion.
+*.db   binary
+*.png  binary
+*.jpg  binary

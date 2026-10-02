@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the README claims and the oldest the annotations in
+        # egress-broker.py are written for; 3.13 is current stable. The matrix
+        # exists because the fallback TOML parser is only exercised below 3.11.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.11", "3.13"]
+        exclude:
+          # Keep the cross-product to something people will wait for.
+          - { os: macos-latest, python: "3.9" }
+          - { os: macos-latest, python: "3.11" }
+          - { os: windows-latest, python: "3.9" }
+          - { os: windows-latest, python: "3.11" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Confirm the tool has no third-party imports
+        # The single-file distribution is the feature. A stray `import requests`
+        # would break every install that only has a Python, so it is checked
+        # rather than assumed.
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+
+          if hasattr(sys, "stdlib_module_names"):
+              stdlib = set(sys.stdlib_module_names)          # 3.10+
+          else:
+              # 3.9 has no such table, so ask the import machinery instead of
+              # hardcoding a list that would rot.
+              import importlib.util
+              probe = sorted({
+                  "argparse", "ast", "base64", "csv", "datetime", "email", "fcntl",
+                  "getpass", "gzip", "hashlib", "hmac", "http", "ipaddress", "json",
+                  "logging", "os", "pathlib", "platform", "pwd", "re", "secrets",
+                  "select", "shlex", "shutil", "signal", "socket", "socketserver",
+                  "sqlite3", "ssl", "statistics", "struct", "subprocess", "sys",
+                  "tarfile", "tempfile", "threading", "time", "tomllib",
+                  "traceback", "types", "unicodedata", "urllib", "uuid", "warnings",
+                  "zlib",
+              })
+              stdlib = set(sys.builtin_module_names)
+              stdlib |= {n for n in probe if importlib.util.find_spec(n)}
+
+          local = {"egress_broker"}
+          bad = []
+          for path in sorted(pathlib.Path(".").rglob("*.py")):
+              if "__pycache__" in path.parts:
+                  continue
+              tree = ast.parse(path.read_text(encoding="utf-8"))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      names = [] if node.level else [(node.module or "").split(".")[0]]
+                  else:
+                      continue
+                  for n in names:
+                      if n and n not in stdlib and n not in local:
+                          bad.append(f"{path}:{node.lineno}: {n}")
+          if bad:
+              print("third-party imports found:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("stdlib only on", sys.version.split()[0])
+          PY
+
+      - name: Selftest
+        # `unittest` exits 0 when it collects nothing, so the check count is
+        # asserted rather than the exit code alone.
+        run: |
+          python egress-broker.py --selftest | tee selftest.log
+          grep -q "all checks passed" selftest.log
+          n=$(grep -c "^  ok   " selftest.log)
+          echo "checks: $n"
+          if [ "$n" -lt 180 ]; then
+            echo "::error::selftest ran $n checks, expected at least 180"
+            exit 1
+          fi
+
+      - name: Selftest can actually fail
+        # Corrupt one expected value and require a non-zero exit. Without this
+        # step, a selftest that silently stopped asserting anything would pass
+        # the count check above and this whole job would be theatre.
+        run: |
+          cp egress-broker.py egress-broker.orig
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path("egress-broker.py")
+          src = p.read_text(encoding="utf-8")
+          marker = 'print("all checks passed")'
+          assert src.count(marker) == 1, "marker is not unique"
+          p.write_text(src.replace(marker, "print('selftest deliberately broken')", 1), encoding="utf-8")
+          PY
+          if python egress-broker.py --selftest; then
+            echo "::error::selftest passed with its result line removed"
+            exit 1
+          fi
+          mv egress-broker.orig egress-broker.py
+
+      - name: End-to-end
+        run: |
+          python tests/test_egress_broker.py 2>&1 | tee e2e.log
+          grep -q "^OK" e2e.log
+          n=$(grep -cE "\.\.\. (ok|FAIL|ERROR)" e2e.log)
+          echo "tests: $n"
+          if [ "$n" -lt 39 ]; then
+            echo "::error::only $n tests ran, expected at least 39"
+            exit 1
+          fi
+
+      - name: Audit chain verifies on a real store, and detects deletion
+        # Serve real traffic, verify the chain, then remove a row from the middle
+        # and require the verify to fail. It has to be a middle row: the oldest
+        # row is the trust anchor, so deleting it cannot be detected and asserting
+        # otherwise would be asserting something the design does not promise.
+        shell: bash
+        run: |
+          set -euo pipefail
+          db="$RUNNER_TEMP/audit.db"
+          python egress-broker.py serve --listen 127.0.0.1:18888 --db "$db" --dry-run &
+          broker=$!
+          trap 'kill "$broker" 2>/dev/null || true' EXIT
+
+          up=0
+          for _ in $(seq 1 50); do
+            if python -c "import socket; socket.create_connection(('127.0.0.1', 18888), 0.5).close()" 2>/dev/null; then
+              up=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$up" -ne 1 ]; then
+            echo "::error::the broker never started listening"
+            exit 1
+          fi
+
+          for path in /v1/chat/completions /v1/chat/completions /v1/messages /nope; do
+            printf 'POST http://api.openai.com%s HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi' "$path" \
+              | python -c "import socket,sys; s=socket.create_connection(('127.0.0.1',18888),10); s.sendall(sys.stdin.buffer.read()); s.recv(65536)"
+          done
+          kill "$broker" 2>/dev/null || true
+          wait "$broker" 2>/dev/null || true
+
+          python egress-broker.py verify --db "$db"
+          echo "chain verified while intact"
+
+          # The path goes in as argv, never spliced into the source: on the
+          # Windows runners $RUNNER_TEMP is a backslash path, and a mangled
+          # literal would open the wrong file or none at all.
+          python - "$db" <<'PY'
+          import sqlite3, sys
+
+          conn = sqlite3.connect(sys.argv[1])
+          rows = conn.execute("SELECT id FROM events ORDER BY id ASC").fetchall()
+          if len(rows) < 3:
+              raise SystemExit(f"only {len(rows)} event(s); cannot delete a mid-chain row")
+          victim = rows[2][0]          # index 0 is the trust anchor, 2 is interior
+          conn.execute("DELETE FROM events WHERE id = ?", (victim,))
+          conn.commit()
+          print("deleted interior row id =", victim)
+          PY
+
+          if python egress-broker.py verify --db "$db"; then
+            echo "::error::verify passed after an interior row was deleted"
+            exit 1
+          fi
+          echo "tampering detected, as it must be"
+
+      - name: No orphaned broker processes
+        shell: bash
+        run: |
+          sleep 1
+          if ps -eo args | grep -F "egress-broker.py serve" | grep -v grep; then
+            echo "::error::a broker process outlived its test"
+            ps -eo pid,args | grep -F "egress-broker.py serve" | grep -v grep
+            exit 1
+          fi
+          echo "none"

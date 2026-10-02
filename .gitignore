@@ -1,0 +1,24 @@
+# Audit stores and their sidecars. These are operational state, not source.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.pid
+
+# Exported audit trails may contain request bodies. Treat them like secrets.
+*.jsonl
+
+# Broker logs
+*.log
+broker.out
+broker.err
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

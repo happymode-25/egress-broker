@@ -1,0 +1,83 @@
+[Unit]
+# Systemd unit for egress-broker.
+#
+# Local storage only: the SQLite store lives under StateDirectory=egress-broker,
+# which systemd creates with 0700 owned by the service user. Nothing here
+# depends on a network service, a container runtime, or a package index.
+#
+# Install:
+#   install -m 0755 egress-broker.py /usr/local/lib/egress-broker/egress-broker.py
+#   install -m 0644 policy.toml          /etc/egress-broker/policy.toml
+#   install -m 0644 egress-broker.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now egress-broker
+#
+# Note: the proxy is meant to sit in front of one agent's HTTP traffic. Binding
+# it to 0.0.0.0 turns it into an open relay for anything that can reach the
+# host, so the default here is loopback.
+
+Description=Egress policy broker for LLM agent traffic
+Documentation=file:///usr/local/lib/egress-broker/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=egress-broker
+Group=egress-broker
+
+ExecStart=/usr/bin/python3 /usr/local/lib/egress-broker/egress-broker.py serve \
+  --listen 127.0.0.1:8888 \
+  --policy /etc/egress-broker/policy.toml \
+  --db /var/lib/egress-broker/audit.db \
+  --retention-days 30 \
+  --max-db-mb 64
+
+Restart=on-failure
+RestartSec=2
+
+# Uncomment to have the store's integrity checked on every start. Left off by
+# default because a non-zero exit here fails the unit, and a flaky start is worse
+# than an unchecked one; pair it with a timer if you want the exit code to matter.
+# ExecStartPost=/usr/bin/python3 /usr/local/lib/egress-broker/egress-broker.py \
+#   verify --db /var/lib/egress-broker/audit.db
+
+# The store is the record of what this tool blocked. It must survive a crash
+# and must not be world-readable.
+StateDirectory=egress-broker
+StateDirectoryMode=0700
+
+# --- hardening ---
+# The broker needs to read its policy, write its own state directory, and
+# resolve DNS (pinning is on by default). Everything else is denied, because a
+# proxy that can be talked into reading arbitrary files is a worse problem than
+# the one it prevents.
+#
+# The AF_UNIX above is what keeps resolution working: systemd-resolved answers
+# over a local socket, so an AF_INET-only restriction would make every pinned
+# lookup fail closed and take the proxy down with it.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
