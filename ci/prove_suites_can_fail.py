@@ -42,15 +42,20 @@ BEHAVIOUR_NEW = "        return True  # deliberately broken by CI\n"
 # Reporting mutation: no engine code changes, one check is made unsatisfiable.
 # Guards the exit path itself, so mutation 1 cannot pass by exiting non-zero for
 # some unrelated reason.
+#
+# Anchored on the tail of selftest(), immediately before the skip/failure
+# report. When this anchor went stale after the summary was reworded, the count
+# check below turned a negative control into a hard failure rather than letting
+# it pass for the wrong reason -- which is what it is for.
 REPORT_OLD = (
-    "    print()\n"
-    "    if failures:\n"
+    "    for s in skipped:\n"
+    '        print(f"  skip {s}")\n'
 )
 REPORT_NEW = (
     '    _expect(False, "negative control injected by CI", failures)\n'
     "\n"
-    "    print()\n"
-    "    if failures:\n"
+    "    for s in skipped:\n"
+    '        print(f"  skip {s}")\n'
 )
 
 

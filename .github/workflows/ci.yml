@@ -53,17 +53,26 @@ jobs:
         run: python ci/import_gate.py
 
       - name: Selftest
-        # The count is asserted, not just the exit code: `unittest` exits 0 when
-        # it collects nothing, and a suite that quietly stopped running is
-        # indistinguishable from a suite that passes.
+        # Two assertions, because the check count is not the same on every
+        # interpreter. Two checks need tomllib (stdlib from 3.11) and are
+        # reported as skipped on 3.9 rather than silently absent -- a suite that
+        # quietly dropped them would otherwise look identical to one that
+        # correctly skipped them. So: many checks must actually RUN, and the
+        # run-plus-skipped total must not have shrunk.
         shell: bash
         run: |
           set -euo pipefail
           python egress-broker.py --selftest | tee selftest.log
-          n=$(grep -c "^  ok   " selftest.log || true)
-          echo "checks: $n"
-          if [ "$n" -lt 200 ]; then
-            echo "::error::selftest ran $n checks, expected at least 200"
+          ran=$(grep -c "^  ok   " selftest.log || true)
+          skipped=$(grep -c "^  skip " selftest.log || true)
+          total=$((ran + skipped))
+          echo "checks: $ran run, $skipped skipped, $total total"
+          if [ "$ran" -lt 200 ]; then
+            echo "::error::selftest ran only $ran checks, expected at least 200"
+            exit 1
+          fi
+          if [ "$total" -lt 203 ]; then
+            echo "::error::selftest covered $total checks, expected at least 203"
             exit 1
           fi
 

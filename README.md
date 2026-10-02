@@ -364,6 +364,14 @@ python tests/test_egress_broker.py                  # real sockets, real subproc
 `unittest` exits 0 when it collects nothing and a suite that quietly stopped
 running is indistinguishable from a suite that passes.
 
+The check count is not the same on every interpreter, so it is asserted as two
+numbers: how many checks actually *ran*, and run-plus-skipped. Two checks need
+`tomllib`, which is stdlib only from 3.11, and on 3.9 the suite prints
+`all checks passed: 201 run, 2 skipped` — the same 203 covered. Asserting only
+the first number would have passed on 3.9 with two checks quietly missing, which
+is exactly the version where the fallback TOML parser is the parser actually in
+use and least worth being untested.
+
 Two of the gates live in `ci/` as files rather than inside the workflow, because
 a check that has never been run is a check that does not work:
 

@@ -2663,7 +2663,24 @@ class _Exploding:
         pass
 
 
-def _expect(condition: bool, label: str, failures: list[str]) -> None:
+class _Failures(list):
+    """The failures so far, which also counts every expectation as it is made.
+
+    A list subclass rather than a plain list because all 161 call sites pass
+    `failures` as `_expect`'s third argument and append to it, while the summary
+    line needs a total that cannot drift out of step with the checks that
+    actually ran. Counting inside `_expect` is the only place that cannot be
+    wrong: a counter maintained at the call sites would silently stop agreeing
+    with reality the first time someone added a check in a new style.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.run = 0
+
+
+def _expect(condition: bool, label: str, failures: _Failures) -> None:
+    failures.run += 1
     if condition:
         print(f"  ok   {label}")
     else:
@@ -2676,7 +2693,12 @@ def selftest() -> int:
     policy_path = os.path.join(here, "policy.toml")
     policy = Policy(_load_toml(policy_path))
     engine = Engine(policy)
-    failures: list[str] = []
+    failures = _Failures()
+    # Checks this interpreter genuinely cannot run. Kept separate from
+    # `failures` and reported in the summary, so a coverage gap that depends on
+    # the Python version stays visible instead of being invisible on the
+    # interpreter where it does not apply.
+    skipped: list[str] = []
 
     def evaluate(body: str, host: str = "api.openai.com", path: str = "/v1/chat/completions"):
         return engine.evaluate("POST", host, 443, path, [], body.encode())
@@ -3199,17 +3221,32 @@ def selftest() -> int:
 
         with open(policy_path, "rb") as fh:
             via_tomllib = tomllib.load(fh)
-        _expect(True, "tomllib is importable here", failures)
-        have_fallback = True
+        have_tomllib = True
     except ImportError:
-        via_tomllib = _mini_toml(policy_path)
-        have_fallback = False
+        via_tomllib = None
+        have_tomllib = False
+    if have_tomllib:
+        _expect(True, "tomllib is importable here", failures)
+    else:
+        # Reported as skipped rather than asserted. Substituting _mini_toml for
+        # the missing tomllib would compare the fallback parser with itself and
+        # print a check that cannot fail, which is worse than no check: it is a
+        # green line standing in for a real cross-check.
+        skipped.append(
+            "tomllib is importable here (stdlib from 3.11; on this interpreter "
+            "_mini_toml is what Policy actually parses with)"
+        )
+        skipped.append(
+            "fallback parser produces an identical structure to tomllib (needs "
+            "tomllib; the structural checks below still exercise _mini_toml here)"
+        )
     via_fallback = _mini_toml(policy_path)
-    _expect(
-        via_fallback == via_tomllib,
-        "fallback parser produces an identical structure to tomllib",
-        failures,
-    )
+    if have_tomllib:
+        _expect(
+            via_fallback == via_tomllib,
+            "fallback parser produces an identical structure to tomllib",
+            failures,
+        )
     reloaded = Policy(via_fallback)
     _expect(
         len(reloaded.destinations) == len(policy.destinations),
@@ -3227,39 +3264,43 @@ def selftest() -> int:
         "fallback parser preserves rule order",
         failures,
     )
-    if have_fallback:
-        nested = os.path.join(here, "_nested_probe.toml")
-        try:
-            with open(nested, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "[[destinations]]\npattern = 'global.example'\naction = 'allow'\n\n"
-                    '[[clients]]\nname = "a"\ncidrs = ["10.0.0.0/8"]\n\n'
-                    "[[clients.destinations]]\npattern = 'x.example'\naction = 'allow'\n\n"
-                    "[[clients.destinations]]\npattern = 'y.example'\naction = 'deny'\n\n"
-                    "[[clients]]\nname = 'b'\nmatch_header = 'x-a'\nmatch_value = 'b'\n"
-                    "[[clients.destinations]]\npattern = 'z.example'\naction = 'allow'\n"
-                )
-            parsed = Policy(_mini_toml(nested))
-            _expect(len(parsed.clients) == 2, "nested array-of-tables parses to two clients", failures)
-            _expect(
-                [c.name for c in parsed.clients] == ["a", "b"],
-                "nested children attach to the client above them",
-                failures,
+    # Not gated on tomllib, deliberately. _mini_toml exists on every supported
+    # version, and on 3.9 it is the parser Policy actually uses, so the version
+    # that most needs it covered is the version that needs it covered most.
+    # These assert _mini_toml's own behaviour, so they need no oracle to
+    # compare against.
+    nested = os.path.join(here, "_nested_probe.toml")
+    try:
+        with open(nested, "w", encoding="utf-8") as fh:
+            fh.write(
+                "[[destinations]]\npattern = 'global.example'\naction = 'allow'\n\n"
+                '[[clients]]\nname = "a"\ncidrs = ["10.0.0.0/8"]\n\n'
+                "[[clients.destinations]]\npattern = 'x.example'\naction = 'allow'\n\n"
+                "[[clients.destinations]]\npattern = 'y.example'\naction = 'deny'\n\n"
+                "[[clients]]\nname = 'b'\nmatch_header = 'x-a'\nmatch_value = 'b'\n"
+                "[[clients.destinations]]\npattern = 'z.example'\naction = 'allow'\n"
             )
-            _expect(
-                len(parsed.clients[0].destinations) == 2
-                and parsed.clients[1].destinations[0]["pattern"] == "z.example",
-                "the second client's destinations do not leak into the first",
-                failures,
-            )
-            _expect(
-                parsed.clients[0].destinations[1]["action"] == "deny",
-                "quoted and unquoted scalars both parse",
-                failures,
-            )
-        finally:
-            if os.path.exists(nested):
-                os.remove(nested)
+        parsed = Policy(_mini_toml(nested))
+        _expect(len(parsed.clients) == 2, "nested array-of-tables parses to two clients", failures)
+        _expect(
+            [c.name for c in parsed.clients] == ["a", "b"],
+            "nested children attach to the client above them",
+            failures,
+        )
+        _expect(
+            len(parsed.clients[0].destinations) == 2
+            and parsed.clients[1].destinations[0]["pattern"] == "z.example",
+            "the second client's destinations do not leak into the first",
+            failures,
+        )
+        _expect(
+            parsed.clients[0].destinations[1]["action"] == "deny",
+            "quoted and unquoted scalars both parse",
+            failures,
+        )
+    finally:
+        if os.path.exists(nested):
+            os.remove(nested)
 
     print("\n[dns pinning]")
     pinner = DnsPinner(ttl=60.0)
@@ -4038,12 +4079,17 @@ def selftest() -> int:
     )
 
     print()
+    for s in skipped:
+        print(f"  skip {s}")
     if failures:
         print(f"FAILED: {len(failures)} check(s)")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("all checks passed")
+    # The counts are in the line itself, machine-readable, because CI asserts
+    # them. An assertion that only counted "ok" lines would be satisfied by a
+    # suite that had quietly dropped its tomllib-dependent checks on 3.9.
+    print(f"all checks passed: {failures.run} run, {len(skipped)} skipped")
     return 0
 
 
