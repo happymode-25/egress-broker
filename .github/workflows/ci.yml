@@ -39,98 +39,61 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # Every step below declares `shell: bash`. The default shell on
+      # windows-latest is PowerShell, where `tee`, `grep`, `[` and `$n` do not
+      # exist -- so an undeclared POSIX step does not fail loudly on Windows, it
+      # fails in a way that looks like the tool is broken. Git Bash is present
+      # on the Windows runners and setup-python's PATH reaches it.
+
       - name: Confirm the tool has no third-party imports
         # The single-file distribution is the feature. A stray `import requests`
         # would break every install that only has a Python, so it is checked
         # rather than assumed.
-        run: |
-          python - <<'PY'
-          import ast, pathlib, sys
-
-          if hasattr(sys, "stdlib_module_names"):
-              stdlib = set(sys.stdlib_module_names)          # 3.10+
-          else:
-              # 3.9 has no such table, so ask the import machinery instead of
-              # hardcoding a list that would rot.
-              import importlib.util
-              probe = sorted({
-                  "argparse", "ast", "base64", "csv", "datetime", "email", "fcntl",
-                  "getpass", "gzip", "hashlib", "hmac", "http", "ipaddress", "json",
-                  "logging", "os", "pathlib", "platform", "pwd", "re", "secrets",
-                  "select", "shlex", "shutil", "signal", "socket", "socketserver",
-                  "sqlite3", "ssl", "statistics", "struct", "subprocess", "sys",
-                  "tarfile", "tempfile", "threading", "time", "tomllib",
-                  "traceback", "types", "unicodedata", "urllib", "uuid", "warnings",
-                  "zlib",
-              })
-              stdlib = set(sys.builtin_module_names)
-              stdlib |= {n for n in probe if importlib.util.find_spec(n)}
-
-          local = {"egress_broker"}
-          bad = []
-          for path in sorted(pathlib.Path(".").rglob("*.py")):
-              if "__pycache__" in path.parts:
-                  continue
-              tree = ast.parse(path.read_text(encoding="utf-8"))
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      names = [a.name.split(".")[0] for a in node.names]
-                  elif isinstance(node, ast.ImportFrom):
-                      names = [] if node.level else [(node.module or "").split(".")[0]]
-                  else:
-                      continue
-                  for n in names:
-                      if n and n not in stdlib and n not in local:
-                          bad.append(f"{path}:{node.lineno}: {n}")
-          if bad:
-              print("third-party imports found:")
-              print("\n".join(bad))
-              sys.exit(1)
-          print("stdlib only on", sys.version.split()[0])
-          PY
+        shell: bash
+        run: python ci/import_gate.py
 
       - name: Selftest
-        # `unittest` exits 0 when it collects nothing, so the check count is
-        # asserted rather than the exit code alone.
+        # The count is asserted, not just the exit code: `unittest` exits 0 when
+        # it collects nothing, and a suite that quietly stopped running is
+        # indistinguishable from a suite that passes.
+        shell: bash
         run: |
+          set -euo pipefail
           python egress-broker.py --selftest | tee selftest.log
-          grep -q "all checks passed" selftest.log
-          n=$(grep -c "^  ok   " selftest.log)
+          n=$(grep -c "^  ok   " selftest.log || true)
           echo "checks: $n"
-          if [ "$n" -lt 180 ]; then
-            echo "::error::selftest ran $n checks, expected at least 180"
+          if [ "$n" -lt 200 ]; then
+            echo "::error::selftest ran $n checks, expected at least 200"
             exit 1
           fi
 
       - name: Selftest can actually fail
-        # Corrupt one expected value and require a non-zero exit. Without this
-        # step, a selftest that silently stopped asserting anything would pass
-        # the count check above and this whole job would be theatre.
-        run: |
-          cp egress-broker.py egress-broker.orig
-          python - <<'PY'
-          import pathlib
-          p = pathlib.Path("egress-broker.py")
-          src = p.read_text(encoding="utf-8")
-          marker = 'print("all checks passed")'
-          assert src.count(marker) == 1, "marker is not unique"
-          p.write_text(src.replace(marker, "print('selftest deliberately broken')", 1), encoding="utf-8")
-          PY
-          if python egress-broker.py --selftest; then
-            echo "::error::selftest passed with its result line removed"
-            exit 1
-          fi
-          mv egress-broker.orig egress-broker.py
+        # Breaks the tool on purpose and requires the suite to notice. Without
+        # this, a selftest that had stopped asserting anything would sail past
+        # the count check above and make the whole job theatre.
+        shell: bash
+        run: python ci/prove_suites_can_fail.py
 
       - name: End-to-end
+        # The count comes from unittest's own `Ran N tests`, not from counting
+        # `... ok` lines: with verbosity=2 a test carrying a docstring puts its
+        # `... ok` on the docstring line, and any line-based count of it is
+        # quietly wrong by however many tests have docstrings.
+        shell: bash
         run: |
+          set -uo pipefail
           python tests/test_egress_broker.py 2>&1 | tee e2e.log
-          grep -q "^OK" e2e.log
-          n=$(grep -cE "\.\.\. (ok|FAIL|ERROR)" e2e.log)
+          status=${PIPESTATUS[0]}
+          n=$(sed -nE 's/^Ran ([0-9]+) tests?.*/\1/p' e2e.log | head -1)
+          n=${n:-0}
           echo "tests: $n"
-          if [ "$n" -lt 39 ]; then
-            echo "::error::only $n tests ran, expected at least 39"
+          if [ "$n" -lt 41 ]; then
+            echo "::error::only $n tests ran, expected at least 41"
             exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the end-to-end suite reported failures (exit $status)"
+            exit "$status"
           fi
 
       - name: Audit chain verifies on a real store, and detects deletion
@@ -192,8 +155,20 @@ jobs:
           echo "tampering detected, as it must be"
 
       - name: No orphaned broker processes
+        # Ubuntu only, on purpose. Under Git Bash `ps` is the MSYS one, which
+        # rejects `-eo args` outright and lists only MSYS processes, so on the
+        # Windows runner this check reported "none" and exited 0 whether or not
+        # a broker survived -- a green tick that proved nothing. The step below
+        # now asserts ps works before trusting its answer, so it cannot fail
+        # silently anywhere.
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
+          set -euo pipefail
+          if ! ps -eo args >/dev/null 2>&1; then
+            echo "::error::ps -eo args is unsupported here, so this check cannot be trusted"
+            exit 1
+          fi
           sleep 1
           if ps -eo args | grep -F "egress-broker.py serve" | grep -v grep; then
             echo "::error::a broker process outlived its test"

@@ -364,6 +364,22 @@ python tests/test_egress_broker.py                  # real sockets, real subproc
 `unittest` exits 0 when it collects nothing and a suite that quietly stopped
 running is indistinguishable from a suite that passes.
 
+Two of the gates live in `ci/` as files rather than inside the workflow, because
+a check that has never been run is a check that does not work:
+
+- `python ci/import_gate.py` fails if any file imports a non-stdlib module. It
+  derives the stdlib's locations from `sys.path` minus the site directories
+  rather than hardcoding them, because three separate assumptions about where
+  the stdlib lives are false on some platform: extension modules sit in `DLLs`,
+  not `Lib`; `os` is frozen on 3.11+ so its "origin" is the string `frozen`; and
+  on Windows `site-packages` is *inside* `Lib`, so an origin-based check happily
+  calls `requests` stdlib.
+- `python ci/prove_suites_can_fail.py` breaks `ip_allowed` so it permits every
+  address, and separately injects one unsatisfiable check, requiring the
+  selftest to fail at each and to be green again afterwards. It also requires
+  the failure to *name a check*: a file too broken to run also exits non-zero,
+  and without that distinction a broken negative control reads as a passing one.
+
 `--selftest` exercises the policy engine as a function: given this policy and this
 body, what is the verdict. It is fast, and when it fails it points at the rule.
 It also covers the store, the hash chain, DNS pinning, client scoping, CONNECT
@@ -462,6 +478,8 @@ entirely. Use it as one layer, not as a trust boundary on its own.
 | `policy.toml` | Default policy. Edit destinations first; the rest is reasonable. |
 | `tests/test_egress_broker.py` | End-to-end suite over real sockets. |
 | `egress-broker.service` | Hardened systemd unit, `StateDirectory` store. |
+| `ci/import_gate.py` | Fails if anything imports outside the standard library. |
+| `ci/prove_suites_can_fail.py` | Breaks the tool on purpose; requires the selftest to notice. |
 | `.github/workflows/ci.yml` | Both suites, the import gate, and the tamper check. |
 
 ## Running as a service
