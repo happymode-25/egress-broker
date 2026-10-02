@@ -247,6 +247,13 @@ class BrokerE2E(unittest.TestCase):
     # -- helpers ------------------------------------------------------------
 
     def rows(self, **kw):
+        # `query` defaults to limit=50, which is right for an operator looking at
+        # recent traffic and catastrophic here: every count above 50 came back as
+        # exactly 50, indistinguishable from a real count. Raising the concurrency
+        # test to 96 clients produced "96 != 50" -- 46 phantom missing rows, and a
+        # hunt through the store for a write-loss bug that does not exist. Any
+        # test asserting a count must be able to see all of them.
+        kw.setdefault("limit", 1_000_000)
         store = eb.SqliteAudit(self.db, retention_days=0, max_bytes=0)
         try:
             return store.query(since_days=36500, **kw)
@@ -499,26 +506,63 @@ class BrokerE2E(unittest.TestCase):
         self.assertIn("max_body_bytes", big[1].get("X-Egress-Reason", ""))
 
     def test_concurrent_clients_are_all_classified(self):
-        results: list[int] = []
+        # 96 clients, not 20. Measured refusal rates over five runs each: with
+        # socketserver's default backlog of 5, a burst of 20 was refused 0 times
+        # out of 5, and even 48 and 64 were refused only 4 times in 5. A guard at
+        # those sizes passes against the bug it exists to catch. At 96 the
+        # backlog-5 case failed 5 times in 5 and the shipped backlog of 128
+        # failed 0 times in 5 -- the only size that separates them cleanly.
+        CLIENTS = 96
+        HALF = CLIENTS // 2
+        results: list[str] = []
+        errors: list[str] = []
         lock = threading.Lock()
+        # Without this the test cannot detect the bug it was written for. The 96
+        # threads then connect as they happen to start, spread over the time it
+        # takes to create them, and the accept queue drains between arrivals. A
+        # separate measurement with a barrier refused 5 of 5 bursts at the old
+        # backlog; this same test without one missed it 5 times out of 5.
+        barrier = threading.Barrier(CLIENTS, timeout=30)
 
         def hit(i: int) -> None:
             host = "evil.ngrok.io" if i % 2 == 0 else "api.openai.com"
-            _, headers, _ = _post(self.port, host, "/x", b"c" * 10)
+            try:
+                barrier.wait()
+                _, headers, _ = _post(self.port, host, "/x", b"c" * 10)
+                decision = headers.get("X-Egress-Decision")
+            except Exception as exc:  # noqa: BLE001
+                # Recorded and reported, not left to die in a thread's stderr.
+                #
+                # This test failed on CI as "AssertionError: 20 != 19", which
+                # names the symptom and nothing about the cause: the missing
+                # client had been reset by the kernel because socketserver
+                # listens with a backlog of 5 and twenty simultaneous connects
+                # overran it. join() returns happily after a thread raises, so
+                # the count mismatch was all that survived. Naming the error
+                # turns a two-hour hunt into a one-line fix.
+                with lock:
+                    errors.append(f"client {i} ({host}): {type(exc).__name__}: {exc}")
+                return
             with lock:
-                results.append(headers.get("X-Egress-Decision"))
+                results.append(decision)
 
         with self.run_broker():
-            threads = [threading.Thread(target=hit, args=(i,)) for i in range(20)]
+            threads = [threading.Thread(target=hit, args=(i,)) for i in range(CLIENTS)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
-        self.assertEqual(20, len(results))
-        self.assertEqual(10, results.count("deny"), "all 10 denylisted requests must be denied")
-        self.assertEqual(10, results.count("allow-dry-run"), "all 10 allowlisted must pass")
+
         self.assertEqual(
-            20, len(self.requests()),
+            [], errors,
+            f"all {CLIENTS} concurrent clients got a response; "
+            f"{len(errors)} were refused or reset at the TCP layer",
+        )
+        self.assertEqual(CLIENTS, len(results), f"{CLIENTS} decisions, got {results}")
+        self.assertEqual(HALF, results.count("deny"), f"all {HALF} denylisted must be denied")
+        self.assertEqual(HALF, results.count("allow-dry-run"), f"all {HALF} allowlisted must pass")
+        self.assertEqual(
+            CLIENTS, len(self.requests()),
             "every concurrent request recorded exactly once (SQLite is per-thread)",
         )
 

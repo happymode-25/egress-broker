@@ -71,8 +71,8 @@ jobs:
             echo "::error::selftest ran only $ran checks, expected at least 200"
             exit 1
           fi
-          if [ "$total" -lt 203 ]; then
-            echo "::error::selftest covered $total checks, expected at least 203"
+          if [ "$total" -lt 204 ]; then
+            echo "::error::selftest covered $total checks, expected at least 204"
             exit 1
           fi
 

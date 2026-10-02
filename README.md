@@ -362,7 +362,7 @@ python egress-broker.py --selftest                  # pure, fast, no sockets
 python tests/test_egress_broker.py                  # real sockets, real subprocesses
 ```
 
-203 checks and 41 tests respectively. CI asserts both numbers, because
+204 checks and 41 tests respectively. CI asserts both numbers, because
 `unittest` exits 0 when it collects nothing and a suite that quietly stopped
 running is indistinguishable from a suite that passes.
 
@@ -444,9 +444,55 @@ is too weak" and neither was:
   the same `resolved_ip`. The tests now address `localhost` and assert the
   recorded address, which a name that was never resolved cannot fake.
 
+**A CI failure that was a real bug, and three false trails.** The end-to-end
+suite failed once with `AssertionError: 20 != 19`. One client of twenty had been
+dropped. The cause was not a test flake: `socketserver` listens with a backlog
+of **5**, twenty simultaneous connects overran it before the broker accepted any,
+and the kernel reset the rest. The agent saw a flaky network instead of a policy
+decision — the one thing this program promises never to do. The backlog is now
+128.
+
+Chasing it turned up three separate ways of being wrong, each of which had to be
+fixed before the real one could be seen:
+
+- The test reported a count, not a cause. `join()` returns happily after a thread
+  raises, so the exception died in a thread's stderr and all that survived was
+  `20 != 19`. Client errors are now collected and named.
+- The test's `rows()` helper called `store.query()` without a limit, and `query`
+  defaults to 50. Every count above 50 came back as exactly 50 — so raising the
+  test to 96 clients produced "96 != 50", 46 rows that were never missing, and a
+  long hunt for a write-loss bug that does not exist. (`store.query` limits to 50
+  rows by default for an operator reading recent traffic. That is correct for
+  `query` and wrong for a test helper, so the helper now says what it wants.)
+- The concurrency test had no barrier, so the 96 threads connected as they
+  happened to start rather than simultaneously. With the bug reintroduced it
+  missed 5 times out of 5; with a barrier it is caught. The earlier 20-client
+  version could not have caught it at all — measured refusal rates at the old
+  backlog of 5 were 0 in 5 runs at 20 clients, and 4 in 5 at 48 and 64. The guard
+  uses 96, the smallest size that fails 5 times out of 5 at backlog 5 and 5 times
+  out of 5 clean at the shipped 128.
+
+Two notes on how that number was chosen, because both are traps:
+
+- Setting `request_queue_size` on a server *instance* does nothing.
+  `server_activate()` has already called `listen()`. The first version of the
+  check assigned it after construction and was measuring a backlog of 5 while
+  believing it measured 128. It is a class attribute for the same reason
+  `ThreadingBroker` sets it as one.
+- A guard set where the bug only shows up 4 times in 5 passes against the bug it
+  exists to catch. That is worse than no guard, because it reads as coverage.
+
 ## Limitations
 
 These are real, not hedging.
+
+**A thread per connection, and a bounded queue.** `ThreadingMixIn` spawns an OS
+thread for every connection, and the accept queue is 128. A burst larger than
+that can still be refused at the TCP layer — from the OS, not from policy. This
+is fine for the traffic it is aimed at (an agent making tens of concurrent calls)
+and is not a design for thousands. Reaching that point wants a selector or a
+process pool, at which point the per-thread SQLite connections here would need
+replacing too.
 
 **No TLS interception.** HTTPS bodies are encrypted and cannot be inspected, so
 body rules apply only to plaintext HTTP. Host-level allow/deny and `allowed_ips`

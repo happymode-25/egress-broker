@@ -2514,6 +2514,20 @@ class ThreadingBroker(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     verbose = False
 
+    # socketserver leaves this at 5. An accept queue five deep is fine for a
+    # human clicking one link at a time and wrong for the thing this proxy
+    # exists for: an agent that fires twenty requests at once fills the queue
+    # before the broker has accepted any of them, and the kernel answers the
+    # rest with RST. The caller then sees a transport error -- a flaky network,
+    # a server that is "down" -- instead of a policy decision, which is the one
+    # thing this program is supposed to always give them.
+    #
+    # Measured: 60 simultaneous clients lost 3 to this, on Windows, with the
+    # broker otherwise healthy. The fix cannot overflow anything; the OS still
+    # caps the queue at SOMAXCONN, and raising it only stops us being the
+    # bottleneck.
+    request_queue_size = 128
+
     def handle_error(self, request, client_address) -> None:
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
@@ -4077,6 +4091,93 @@ def selftest() -> int:
         "CONNECT preserves host casing for the matcher to normalise",
         failures,
     )
+
+    # -- accept queue survives a burst -------------------------------------
+    # Found in production, not thought up: the end-to-end suite failed on CI with
+    # "20 != 19" and the one lost client was a ConnectionResetError from the
+    # kernel. socketserver listens with a backlog of 5, twenty simultaneous
+    # clients overrun it before the broker accepts any, and the caller gets a
+    # transport failure instead of a policy decision -- the one thing this
+    # program promises never to do.
+    #
+    # A live burst rather than an assertion about a class attribute, because the
+    # attribute is not what failed. It was set correctly on the server and still
+    # not enough once real connections arrived.
+    print("\n[accept queue survives a burst of clients]")
+
+    class _Accepter(socketserver.BaseRequestHandler):
+        def handle(self) -> None:  # noqa: D102 - socketserver protocol
+            try:
+                self.request.recv(1)
+            except OSError:
+                pass
+
+    class _BurstServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        # Set as class attributes *before* instantiation, exactly as
+        # ThreadingBroker does. Assigning `probe.request_queue_size = N` to an
+        # instance afterwards does nothing at all: server_activate() already
+        # called listen() with the default, so the first version of this check
+        # measured a backlog of 5 while believing it measured 128, and failed
+        # 107 of 168 connections against the shipped configuration.
+        daemon_threads = True
+        allow_reuse_address = True
+        request_queue_size = ThreadingBroker.request_queue_size
+
+    def _burst_once(addr: tuple[str, int], n: int) -> list[str]:
+        refused: list[str] = []
+        # Line every thread up first, so the connections really are simultaneous
+        # rather than serialised by the GIL.
+        barrier = threading.Barrier(n, timeout=30)
+
+        def one() -> None:
+            try:
+                barrier.wait()
+                with socket.create_connection(addr, timeout=30) as conn:
+                    conn.sendall(b"x")
+                    conn.recv(1)
+            except Exception as exc:  # noqa: BLE001
+                refused.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=one) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        return refused
+
+    try:
+        probe = _BurstServer(("127.0.0.1", 0), _Accepter)
+    except OSError as exc:
+        # A sandbox that forbids listening is a legitimate environment, not a
+        # defect in the broker. Say so rather than passing silently.
+        skipped.append(f"accept-queue burst (could not bind a local socket: {exc})")
+    else:
+        served = threading.Thread(target=probe.serve_forever, daemon=True)
+        served.start()
+        try:
+            # 96, not "the backlog plus a bit". Measured refusal rates over five
+            # runs each: at a backlog of 5, bursts of 48 and 64 were refused 4
+            # times in 5 -- so a guard at those sizes passes against the bug it
+            # exists to catch, which is worse than no guard. 96 was refused 5
+            # times in 5 at backlog 5 and 0 times in 5 at the shipped 128.
+            size = 96
+            worst = 0
+            sample: list[str] = []
+            for _ in range(2):        # twice, so one lucky run cannot pass it
+                sample = _burst_once(probe.server_address, size)
+                worst = max(worst, len(sample))
+                if sample:
+                    break
+            _expect(
+                not sample,
+                f"{size} simultaneous clients all got a connection "
+                f"(backlog {ThreadingBroker.request_queue_size}; "
+                f"{worst} refused, e.g. {sample[:1]})",
+                failures,
+            )
+        finally:
+            probe.shutdown()
+            probe.server_close()
 
     print()
     for s in skipped:
