@@ -534,6 +534,7 @@ entirely. Use it as one layer, not as a trust boundary on its own.
 | `policy.toml` | Default policy. Edit destinations first; the rest is reasonable. |
 | `tests/test_egress_broker.py` | End-to-end suite over real sockets. |
 | `egress-broker.service` | Hardened systemd unit, `StateDirectory` store. |
+| `REPORT.md` | Engineering report: features, verification, the backlog defect, and the mutation sweep. |
 | `ci/import_gate.py` | Fails if anything imports outside the standard library. |
 | `ci/prove_suites_can_fail.py` | Breaks the tool on purpose; requires the selftest to notice. |
 | `ci/mutation.py` | Mutates a throwaway copy one line at a time and requires the suites to notice. Canary-guarded: it never touches the working tree. |
