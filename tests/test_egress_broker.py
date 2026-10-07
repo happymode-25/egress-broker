@@ -906,6 +906,32 @@ class BrokerE2E(unittest.TestCase):
             "is the port the policy was judged against",
         )
 
+    def test_a_request_with_no_host_header_is_refused_fail_closed(self):
+        """A request with no Host header must not acquire a host of its own.
+
+        http.client always synthesises one, so this shape can only go out as raw
+        bytes -- which is why nothing covered it: no helper could produce it, so
+        every test asserted the same well-formed request a second time. The
+        handler's fallback for an absent Host decides the whole outcome, and a
+        fallback constant such as loopback would hand an unhosted request the
+        privileges of localhost. It is also the shape a request smuggler sends.
+        """
+        with self.run_broker():
+            code, headers, body = _raw(
+                self.port,
+                b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n",
+                b"c\n",
+            )
+        self.assertDenied(
+            (code, headers, body), "a request with no Host header"
+        )
+        events = self.requests()
+        self.assertEqual(1, len(events), "the refused request is still recorded")
+        self.assertNotEqual(
+            "127.0.0.1", events[0]["host"],
+            "an absent Host must not become loopback",
+        )
+
     # -- per-client scoping --------------------------------------------------
 
     def _scoped_policy(self, name: str) -> str:

@@ -362,14 +362,14 @@ python egress-broker.py --selftest                  # pure, fast, no sockets
 python tests/test_egress_broker.py                  # real sockets, real subprocesses
 ```
 
-204 checks and 41 tests respectively. CI asserts both numbers, because
+210 checks and 42 tests respectively. CI asserts both numbers, because
 `unittest` exits 0 when it collects nothing and a suite that quietly stopped
 running is indistinguishable from a suite that passes.
 
 The check count is not the same on every interpreter, so it is asserted as two
 numbers: how many checks actually *ran*, and run-plus-skipped. Two checks need
 `tomllib`, which is stdlib only from 3.11, and on 3.9 the suite prints
-`all checks passed: 201 run, 2 skipped` — the same 203 covered. Asserting only
+`all checks passed: 208 run, 2 skipped` — the same 210 covered. Asserting only
 the first number would have passed on 3.9 with two checks quietly missing, which
 is exactly the version where the fallback TOML parser is the parser actually in
 use and least worth being untested.
@@ -536,6 +536,7 @@ entirely. Use it as one layer, not as a trust boundary on its own.
 | `egress-broker.service` | Hardened systemd unit, `StateDirectory` store. |
 | `ci/import_gate.py` | Fails if anything imports outside the standard library. |
 | `ci/prove_suites_can_fail.py` | Breaks the tool on purpose; requires the selftest to notice. |
+| `ci/mutation.py` | Mutates a throwaway copy one line at a time and requires the suites to notice. Canary-guarded: it never touches the working tree. |
 | `.github/workflows/ci.yml` | Both suites, the import gate, and the tamper check. |
 
 ## Running as a service

@@ -3165,6 +3165,16 @@ def selftest() -> int:
             "concurrent writes all landed (120 events)",
             failures,
         )
+        # Landing 120 rows is not the same as landing 120 rows that still form a
+        # chain. Each thread owns its connection, so without _chain_lock two
+        # threads race on lastrowid and prev_hash: the count still comes out 120
+        # and the links disagree. Counting is blind to that; only walking the
+        # chain notices, which is what the lock is there to protect.
+        _expect(
+            conc.verify_chain()["ok"],
+            "the chain still verifies after 120 writes from 6 threads",
+            failures,
+        )
         for t in threads:
             del t
         conc.close()
@@ -3714,6 +3724,31 @@ def selftest() -> int:
         "three hits after the window slid out fire once more (not never)",
         failures,
     )
+    # A fired alert must reach the sink on its own. The block below writes the
+    # row with record_alert() by hand and then asserts it is present, which
+    # checks the row encoding and nothing else -- so deleting the _emit() call
+    # that actually delivers an alert left every one of those assertions green.
+    wired = SqliteAudit(
+        os.path.join(store_dir, "alerts_wired.db"), retention_days=0, max_bytes=0
+    )
+    wired_engine = AlertEngine(
+        [AlertRule.from_dict(
+            {"name": "must_reach_the_sink", "metric": "rule_hits", "selector": "s",
+             "threshold": 1, "window_minutes": 5, "cooldown_minutes": 0}
+        )],
+        wired,
+    )
+    wired_engine.observe(
+        {"event": "request", "host": "h", "action": "deny",
+         "findings": [{"rule": "s", "kind": "secret", "action": "deny"}]}
+    )
+    _expect(
+        any(a["name"] == "must_reach_the_sink" for a in wired.read_alerts(since_days=1)),
+        "a fired alert reaches the sink without anyone writing the row by hand",
+        failures,
+    )
+    wired.close()
+
     # An alert must survive the trip into the store, since stderr is gone by the
     # time anyone reads the evidence.
     alert_store = SqliteAudit(
@@ -3900,6 +3935,48 @@ def selftest() -> int:
             failures,
         )
         prunable.close()
+
+        # The check above performs its deletion with SQL and then calls
+        # _refresh_head() itself, so it passes whatever prune() does -- which is
+        # why a prune that forgot to re-point the head survived it. Reach the
+        # same state through the public path instead.
+        #
+        # Retention deletes a PREFIX, so the newest row never moves and the head
+        # is already correct; skipping _refresh_head() changes nothing there. It
+        # only matters when nothing survives, so this case empties the store:
+        # then the stored head either becomes GENESIS_HASH or keeps pointing at a
+        # row that no longer exists.
+        emptied_db = os.path.join(chain_dir, "emptied.db")
+        filled = SqliteAudit(emptied_db, retention_days=0, max_bytes=0)
+        for i in range(6):
+            filled.record({"event": "request", "host": f"e{i}.example", "action": "allow"})
+        filled.close()
+        emptied = SqliteAudit(emptied_db, retention_days=0, max_bytes=0)
+        # now in the future and a one-day window, so every row is past retention.
+        removed_all = emptied.prune(now=time.time() + 10 * 86400, retention_days=1)
+        _expect(
+            removed_all == 6,
+            f"retention emptied the store (removed {removed_all} of 6)",
+            failures,
+        )
+        gone_head, gone_count = emptied.chain_head()
+        _expect(
+            gone_count == 0,
+            "the emptied store reports no rows",
+            failures,
+        )
+        _expect(
+            gone_head == GENESIS_HASH,
+            "an emptied store reports the genesis head, not a deleted row's hash "
+            f"(got {gone_head!r})",
+            failures,
+        )
+        _expect(
+            emptied.verify_chain()["ok"],
+            "an emptied store still verifies",
+            failures,
+        )
+        emptied.close()
 
         # A store opened with chaining off still works and still self-reports.
         plain_db = os.path.join(chain_dir, "plain.db")

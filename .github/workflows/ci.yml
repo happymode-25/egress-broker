@@ -67,12 +67,13 @@ jobs:
           skipped=$(grep -c "^  skip " selftest.log || true)
           total=$((ran + skipped))
           echo "checks: $ran run, $skipped skipped, $total total"
-          if [ "$ran" -lt 200 ]; then
-            echo "::error::selftest ran only $ran checks, expected at least 200"
+          # 208 is what runs on 3.9, where the two tomllib cross-checks skip.
+          if [ "$ran" -lt 208 ]; then
+            echo "::error::selftest ran only $ran checks, expected at least 208"
             exit 1
           fi
-          if [ "$total" -lt 204 ]; then
-            echo "::error::selftest covered $total checks, expected at least 204"
+          if [ "$total" -lt 210 ]; then
+            echo "::error::selftest covered $total checks, expected at least 210"
             exit 1
           fi
 
@@ -96,8 +97,8 @@ jobs:
           n=$(sed -nE 's/^Ran ([0-9]+) tests?.*/\1/p' e2e.log | head -1)
           n=${n:-0}
           echo "tests: $n"
-          if [ "$n" -lt 41 ]; then
-            echo "::error::only $n tests ran, expected at least 41"
+          if [ "$n" -lt 42 ]; then
+            echo "::error::only $n tests ran, expected at least 42"
             exit 1
           fi
           if [ "$status" -ne 0 ]; then
